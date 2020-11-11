@@ -1,0 +1,15 @@
+[Unit]
+Description=PotPi-Picoffload
+After=multi-user.target
+
+[Service]
+Type=idle
+
+User=pi
+ExecStart=python3 /usr/local/PotPi/bin/pictureoffload.py
+
+Restart=always
+RestartSec=5
+WorkingDirectory=/home/pi/Desktop
+[Install]
+WantedBy=multi-user.target

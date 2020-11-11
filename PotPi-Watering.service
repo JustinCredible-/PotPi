@@ -1,0 +1,15 @@
+[Unit]
+Description=PotPi-Watering
+After=multi-user.target
+
+[Service]
+Type=idle
+
+User=pi
+ExecStart=/usr/local/PotPi/env/bin/python3 /usr/local/PotPi/env/bin/watering.py
+
+Restart=always
+RestartSec=5
+WorkingDirectory=/home/pi/Desktop
+[Install]
+WantedBy=multi-user.target
