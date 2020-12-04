@@ -24,6 +24,8 @@ Pip3 install RPI.BOARD
 
 Pip3 install influxdb
 
+pip3 install pyfirmata
+
 Pip3 install schedule
 
 Pip3 install wget
