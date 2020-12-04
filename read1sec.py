@@ -1,19 +1,95 @@
-import time
-import board
-import busio
-import adafruit_sht31d
-import datetime as dt
-import logging
-import configparser
-import sys
-import math
-import os
-import schedule
+import time 
+import board 
+import busio 
+import adafruit_sht31d 
+import datetime as dt 
+import logging 
+import configparser 
+import sys 
+import math 
+import os 
+import schedule 
 import RPi.GPIO as GPIO
 #from adafruit_seesaw.seesaw import Seesaw
 from decimal import *
 from subprocess import check_output
 from influxdb import InfluxDBClient
+from pyfirmata import Arduino, util
+import os.path
+from os import path
+import functools
+i2caddress = "0x45"
+devices = {0:{"device":"","pin":"2","status":"Uninit","name":"heater"},1:{"device":"","pin":"4","status":"Uninit","name":"fan"},2:{"device":"","pin":"7","status":"Uninit","name":"humidifier"},3:{"device":"","pin":"8","status":"Uninit","name":"water"}}
+
+duino = ""
+
+def catch_exceptions(cancel_on_failure=False):
+    def catch_exceptions_decorator(job_func):
+        @functools.wraps(job_func)
+        def wrapper(*args, **kwargs):
+            try:
+                return job_func(*args, **kwargs)
+            except:
+                import traceback
+                print(traceback.format_exc())
+                if cancel_on_failure:
+                    return schedule.CancelJob
+        return wrapper
+    return catch_exceptions_decorator
+
+@catch_exceptions(cancel_on_failure=True)
+def connectArduino():
+    global duino, heater, fan, humidifier, devices
+    a=0
+    while a < 5:
+        duino = ""
+        comport = "/dev/ttyACM"+str(a)
+        if path.exists(comport):
+            duino = Arduino(comport)
+            logger.debug(duino)
+            if str(duino).startswith("Arduino"):
+                logger.debug("Connected to Arduino.")
+                a = 5
+                logger.debug("Connecting peripherals.")
+                l = 0
+                while l < len(devices):
+                    devices[l]["device"] = duino.get_pin('d:'+devices[l]["pin"]+':o')
+                    if devices[l]["device"] != "Uninit":
+                        devname = devices[l]["name"]
+                        logger.debug("Connected to " + devname + " successfully on "+str(devices[l]["device"]))
+                        dowrite(devname,0)
+                        logger.debug("New status of " + devname + ": "+str(devices[l]["status"]))
+                    l = l + 1
+   #             duino.digital[2].write(1)
+    #            duino.digital[4].write(1)
+     #           duino.digital[7].write(1)
+        a=a+1
+
+def dowrite(device,status):
+    global devices
+    todevice = ""
+    d = 0
+    while todevice == "":
+        if (device == devices[d]["name"]):
+            todevice = "found"
+            devices[d]["device"].write(status)
+            devices[d]["status"] = devices[d]["device"].read()
+        d = d+1    
+
+def getstatus(device):
+    global devices
+    fromdevice = ""
+    d=0
+    while fromdevice == "":
+        if (device == devices[d]["name"]):
+            fromdevice = "found"
+            chkstatus = devices[d]["device"].read()
+            devices[d]["status"] = chkstatus
+            if (chkstatus == 0):
+                return "off"
+            elif (chkstatus == 1):
+                return "on"
+        d = d+1
 
 def setupLogging():
     global logger
@@ -28,7 +104,8 @@ def setupLogging():
         print("Logging failed to start: " + str(e))
     else:
         return str("ok")
-        
+
+@catch_exceptions(cancel_on_failure=True)       
 def shipEnviroData(grafTemp, grafHum, grafvpd, graffan, grafheat, grafhumi):
     global sensortype
 
@@ -48,13 +125,38 @@ def shipEnviroData(grafTemp, grafHum, grafvpd, graffan, grafheat, grafhumi):
                     "3.01": grafvpd,
                     "11.01": graffan,
                     "12.01": grafhumi,
-                    "13.01": grafheat
+                    "13.01": grafheat,
+                    "1.07": 0
                 }
             }
         ]
         client.write_points(enviroData, time_precision='ms')
     except Exception as e:
         logger.debug("Cannot ship data to grafana: "+str(e))
+
+@catch_exceptions(cancel_on_failure=True)
+def water():
+    global relaytype, wateringtime
+    try:
+        if relaytype == "arduino":
+            dowrite("water",1)
+            iso = time.ctime()
+            waterData = [{"measurement": "rpi-sht-31d","tags": {"sensortype": "environmental"},"time": iso,"fields": {"1.07" : 1}}]
+            client.write_points(waterData, time_precision='ms')
+            time.sleep(wateringtime)
+            iso = time.ctime()
+            waterData = [{"measurement": "rpi-sht-31d","tags": {"sensortype": "environmental"}, "time": iso,"fields": {"1.07": 0 }}] 
+            client.write_points(waterData, time_precision='ms')
+            dowrite("water",0)
+            iso = time.ctime()
+            waterData = [{"measurement": "rpi-sht-31d","tags": {"sensortype": "environmental"},"time": iso,"fields": {"1.07" : 0}}]
+            client.write_points(waterData, time_precision='ms')
+    except Exception as e:
+        logger.debug("Cannot water: "+str(e))
+        dowrite("water",0)
+    else:
+        return str("ok")
+
 
 def setupGPIO():
     try:
@@ -68,7 +170,7 @@ def setupGPIO():
         logger.debug("GPIO setup failed: " + str(e))
     else:
         return str("ok")
-        
+         
 def fanon():
     global fanoncycles, relaytype
     try:
@@ -76,8 +178,9 @@ def fanon():
             check = check_output("/usr/local/PotPi/env/bin/python3 /usr/local/PotPi/env/bin/wemo switch fan on",shell=True)
         elif relaytype == "wired":
             GPIO.output(27,0)
-        fanoncycles += 1
-        logger.debug("Fan turned on. Count: "+str(fanoncycles))
+        elif relaytype == "arduino":
+            dowrite("fan",1)
+        logger.debug("Fan turned on.")
     except Exception as e:
         logger.debug("Could not turn on fan: "+str(e))
         
@@ -88,6 +191,8 @@ def fanoff():
             check = check_output("/usr/local/PotPi/env/bin/python3 /usr/local/PotPi/env/bin/wemo switch fan off",shell=True)
         elif relaytype == "wired":
             GPIO.output(27,1)
+        elif relaytype == "arduino":
+            dowrite("fan",0)
         fanoffcycles += 1
         logger.debug("Fan turned off. Count: "+str(fanoffcycles))
     except Exception as e:
@@ -100,6 +205,8 @@ def humidifieron():
             check = check_output("/usr/local/PotPi/env/bin/python3 /usr/local/PotPi/env/bin/wemo switch humidifier on",shell=True)
         elif relaytype == "wired":
             GPIO.output(17,0)
+        elif relaytype == "arduino":
+            dowrite("humidifier",1)
         humidifieroncycles += 1    
         logger.debug("Humidifier turned on. Count: "+str(humidifieroncycles))
     except Exception as e:
@@ -112,6 +219,8 @@ def humidifieroff():
             check_output("/usr/local/PotPi/env/bin/python3 /usr/local/PotPi/env/bin/wemo switch humidifier off",shell=True)
         elif relaytype == "wired":
             GPIO.output(17,1)
+        elif relaytype == "arduino":
+            dowrite("humidifier",0)
         humidifieroffcycles += 1
         logger.debug("Humidifier turned off. Count: "+str(humidifieroffcycles))
     except Exception as e:
@@ -124,6 +233,8 @@ def heateron():
             check_output("/usr/local/PotPi/env/bin/python3 /usr/local/PotPi/env/bin/wemo switch 'heater bud 1' on",shell=True)
         elif relaytype == "wired":
             GPIO.output(4,0)
+        elif relaytype == "arduino":
+            dowrite("heater",1)
         heateroncycles += 1
         logger.debug("Heater turned on. Count: "+str(heateroncycles))
     except Exception as e:
@@ -136,6 +247,8 @@ def heateroff():
             check_output("/usr/local/PotPi/env/bin/python3 /usr/local/PotPi/env/bin/wemo switch 'heater bud 1' off",shell=True)
         if relaytype == "wired":
             GPIO.output(4,1)
+        elif relaytype == "arduino":
+            dowrite("heater",0)
         heateroffcycles += 1
         logger.debug("Heater turned off. Count: "+str(heateroffcycles))
     except Exception as e:
@@ -168,10 +281,13 @@ def checkfan():
             return str(check)
         elif relaytype == "wired":
             pinstate = GPIO.input(27)
-            if pinstate == 0:
-                return "on"
-            elif pinstate == 1:
+            if pinstate == 1:
                 return "off"
+            elif pinstate == 0:
+                return "on"
+        elif relaytype == "arduino":
+            check = getstatus("fan")
+            return check
     except Exception as e:
         logger.debug("Could not get fan status: "+str(e))
         
@@ -183,10 +299,13 @@ def checkhumidifier():
             return str(check)
         elif relaytype == "wired":
             pinstate = GPIO.input(17)
-            if pinstate == 0:
-                return "on"
-            elif pinstate == 1:
+            if pinstate == 1:
                 return "off"
+            elif pinstate == 0:
+                return "on"
+        elif relaytype == "arduino":
+            check = getstatus("humidifier")
+            return check
     except Exception as e:
         logger.debug("Could not get humidifier status: "+str(e))
         
@@ -198,10 +317,13 @@ def checkheater():
             return str(check)
         elif relaytype == "wired":
             pinstate = GPIO.input(4)
-            if pinstate == 0:
-                return "on"
-            elif pinstate == 1:
+            if pinstate == 1:
                 return "off"
+            elif pinstate == 0:
+                return "on"
+        elif relaytype == "arduino":
+            check = getstatus("heater")
+            return check
     except Exception as e:
         logger.debug("Could not get heater status: "+str(e))
         
@@ -294,7 +416,7 @@ def connectSensors():
     #Connect to sensors
     try:
         #Temp/humidity sensor
-        sensor = adafruit_sht31d.SHT31D(i2c,0x45)
+        sensor = adafruit_sht31d.SHT31D(i2c,i2caddress)
         #Soil sensors
         #ss.insert(0, Seesaw(i2c, addr=0x36))
         #ss.insert(1, Seesaw(i2c, addr=0x37))
@@ -309,7 +431,7 @@ def setupInfluxDB():
     global client
     try:
         # Configure InfluxDB connection variables
-        host = "10.0.0.13" # My Ubuntu NUC
+        host = "10.1.10.13" # IP address of InfluxDB server
         port = 8086 # default port
         user = "rpi-3" # the user/password created for the pi, with write access
         password = "data@LOG" 
@@ -342,10 +464,11 @@ def getsoiltemp(i):
         return temp
 
 def readconfig():
-    global nighttemphigh, nighttemplow, nighthumhigh, nighthumlow, temphigh, templow, humhigh, humlow, coldprotecttemp, sleeptime, vpdset, nightvpdset, starthr, startmin, stophr, stopmin
+    global nighttemphigh, nighttemplow, wateringtime, nighthumhigh, nighthumlow, temphigh, templow, humhigh, humlow, coldprotecttemp, sleeptime, vpdset, nightvpdset, starthr, startmin, stophr, stopmin
     try:
         config = configparser.ConfigParser()
         config.read('/usr/local/PotPi/bin/config.ini')
+        wateringtime = Decimal(config['DEFAULT']['WATERINGTIME']) #90 seconds
         starthr = Decimal(config['DEFAULT']['STARTHR'])
         startmin = Decimal(config['DEFAULT']['STARTMIN'])
         stophr = Decimal(config['DEFAULT']['STOPHR'])
@@ -379,20 +502,22 @@ def fixvpd():
         logger.debug("Day VPD adjustment")
         if vpd < vpdset:
             logger.debug("VPD below target")
-            #if "on" in humidifierstatus:
-               # logger.debug("turning humidifier off.")
-                #humidifieroff()
+            if "on" in humidifierstatus:
+                logger.debug("turning humidifier off.")
+                humidifieroff()
             if "off" in fanstatus:
-                logger.debug("Turning fan on")
-                fanon()
+                if temp >= templow:
+                    logger.debug("Turning fan on")
+                    fanon()
         elif vpd > vpdset:
             logger.debug("VPD above target")
-            #if "off" in humidifierstatus:
-                #logger.debug("turning humidifier on.")
-                #humidifieron()
+            if "off" in humidifierstatus:
+                logger.debug("turning humidifier on.")
+                humidifieron()
             if "on" in fanstatus:
-                logger.debug("turning fan off.")
-                fanoff()
+               if temp <= temphigh:
+                   logger.debug("turning fan off.")
+                   fanoff()
 #night
     elif when == False:
         logger.debug("Night VPD adjustment")
@@ -400,11 +525,15 @@ def fixvpd():
             logger.debug("VPD below target")
             if "off" in fanstatus:
                 #if humidity > nighthumhigh:
-                logger.debug("Humidity is "+str(humidity)+", turning fan on.")
-                fanon()
+                if (temp > 15) or (vpd < 0.7):
+                    logger.debug("Humidity is "+str(humidity)+", turning fan on.")
+                    fanon()
             if "on" in humidifierstatus:
                 logger.debug("Humidifier turned off")
                 humidifieroff()
+            if "on" in fanstatus:
+               if (temp <15) or (vpd>0.9):
+                 fanoff()
 
         elif vpd > nightvpdset:
             logger.debug("VPD above target")
@@ -412,9 +541,9 @@ def fixvpd():
                 #if humidity > nighthumhigh:
                 logger.debug("Humidity is "+str(humidity)+", turning fan off.")
                 fanoff()
-            #if "off" in humidifierstatus:
-                #logger.debug("Humidifier turned on")
-                #humidifieron()
+            if "off" in humidifierstatus:
+                logger.debug("Humidifier turned on")
+                humidifieron()
 
 def fixtemp():
     global temp, temphigh, nighttemphigh, fanstatus, fanoncycles, templow, nighttemplow, fanoffcycles, coldprotecttriggered, coldprotecttemp, when, heaterstatus
@@ -439,8 +568,9 @@ def fixtemp():
                 #if "off" in fanstatus:
                     #fanon()
         elif temp <= (nighttemplow):
-            #if "on" in fanstatus:
-               # fanoff()
+            if "on" in fanstatus:
+                if (vpd > 0.9):
+                    fanoff()
             if "off" in heaterstatus:
                 logger.debug("Temperature is "+str(temp)+", turning heater on.")
                 heateron()
@@ -459,16 +589,17 @@ def fixtemp():
     elif when == True:
 #Day
         logger.debug("Day temp adjustment:")
-        if temp >= temphigh:
-            if "off" in fanstatus:
-                logger.debug("Temperature is "+str(temp)+", turning fan on.")
-                fanon()
-            elif "on" in fanstatus:
-                logger.debug("Temp is above High Temp setting. Fan is on already.")
-            if "on" in heaterstatus:
-                logger.debug("Turning heater off.")
-                heateroff()
-        elif temp < templow:
+        if temp >= templow:
+            if temp >= temphigh:
+                if "off" in fanstatus:
+                    logger.debug("Temperature is "+str(temp)+", turning fan on.")
+                    fanon()
+                elif "on" in fanstatus:
+                    logger.debug("Temp is above High Temp setting. Fan is on already.")
+                if "on" in heaterstatus:
+                  logger.debug("Turning heater off.")
+                  heateroff()
+        elif temp < temphigh:
             if "on" in fanstatus:
                 if vpd <= vpdset:
                     logger.debug("Temperature is "+str(temp)+", turning fan off.")
@@ -476,8 +607,9 @@ def fixtemp():
             elif  "off" in fanstatus:
                 logger.debug("Temp is below Low Temp setting. Fan is off already.")
             if "off" in heaterstatus:
-                logger.debug("Turning heater on.")
-                heateron()
+                if temp < 20:
+                    logger.debug("Turning heater on.")
+                    heateron()
         if coldprotecttriggered == 1:
             if temp >= templow:
                 try:
@@ -553,12 +685,10 @@ def fixhum():
 def checktime(starthour, startmin, stophour, stopmin):
     # Set the now time to an integer that is hours * 60 + minutes
     n = dt.datetime.now()
-    curr = n.hour * 60 + n.minute 
-     
+    curr = n.hour * 60 + n.minute
     # Set the start time to an integer that is hours * 60 + minutes
     str = dt.time(starthour, startmin)
-    start = str.hour * 60 + str.minute 
-     
+    start = str.hour * 60 + str.minute
     # Set the stop time to an integer that is hours * 60 + minutes
     stp = dt.time(stophour, stopmin)
     stop = stp.hour * 60 + stp.minute
@@ -578,11 +708,11 @@ def checktime(starthour, startmin, stophour, stopmin):
 def getsoilinfo(i):
     try:
         ssm = getsoilmoisture(i)
-        sst = getsoiltemp(i) 
+        sst = getsoiltemp(i)
         logger.debug("Soil "+str(i)+" Moisture: "+str(ssm)+" Temp: "+str(round(Decimal(sst),2)))
     except Exception as e:
         logger.debug("Could not read soil moisture/temp sensor "+str(i)+": "+str(e))
-             
+
 ####INITIALIZATION####
 #parameters:
 curehumhigh = 55.0
@@ -598,8 +728,8 @@ heateroncycles = 0
 heateroffcycles = 0
 humidifierstatus = "not set"
 fanstatus = "not set"
-heaterstatus = "not set" 
-coldprotecttriggered = 0    
+heaterstatus = "not set"
+coldprotecttriggered = 0
 starthr = 6# before midnight
 startmin = 00
 stophr = 23 # after midnight
@@ -608,19 +738,22 @@ vpdset = 1.55 #set default value
 nightvpdset = 1.0 #set default value
 sleeptime = 5
 coldprotecttemp = 16.0
-relaytype = "wired"
+relaytype = "arduino"
 ss = []
+wateringtime = 90
 
 #Set up logging
 logger = ""
 if setupLogging() == "ok":
     logger.debug("Script started.")
-    
+
     #Configure GPIO if relays are wired
     if relaytype == "wired":
         logger.debug("Setting up GPIO.")
         setupGPIO()
-            
+    if relaytype == "arduino":
+        logger.debug("Connecting to Arduino.")
+        connectArduino()
     #I2C connectivity
     i2c = ""
     logger.debug("Connecting I2C.")
@@ -637,6 +770,9 @@ if setupLogging() == "ok":
                 readconfig()
                 ####MAIN LOOP####
                 logger.debug("Running main program")
+                schedule.every().day.at("08:30").do(water)
+                schedule.every().day.at("14:00").do(water)
+                schedule.every().day.at("21:30").do(water)
                 while True:
                     try:
                         #time.sleep(60)
@@ -651,22 +787,7 @@ if setupLogging() == "ok":
                         fanstatus = checkfan()
                         humidifierstatus = checkhumidifier()
                         heaterstatus = checkheater()
-                        #getsoilinfo(0)
-                        #getsoilinfo(1)
-                        #getsoilinfo(2)
-                        #getsoilinfo(3)
-                        #ssm0 = getsoilmoisture(0)
-                        #ssm1 = getsoilmoisture(1)
-                        #ssm2 = getsoilmoisture(2)
-                        #ssm3 = getsoilmoisture(3)
-                        #if ssm0 > 2000:
-                            #ssm0=0
-                        #if ssm1 > 2000:
-                            #ssm1=0
-                        #if ssm2 > 2000:
-                            #ssm2=0
-                        #if ssm3 > 2000:
-                            #ssm3=0
+
                         if "on" in fanstatus:
                             graffan = "1"
                         elif "off" in fanstatus:
@@ -691,13 +812,14 @@ if setupLogging() == "ok":
                         logger.debug("Temperature: "+str(temp))
                         logger.debug("Humidity: "+str(humidity))
                         calcVPD()
-                        #shipEnviroData(float(temp),float(humidity),float(vpd),0.00,0.00,0.00)
                         shipEnviroData(float(temp),float(humidity),float(vpd),float(graffan), float(grafheat), float(grafhumi))
                         fixtemp()
                         fixvpd()
                         #fixhum()
                         #cure()
+                        schedule.run_pending()
                         loopcount += 1
-                        time.sleep(int(sleeptime))
+                        time.sleep(int(25))
                     except Exception as e:
                         logger.debug("Loop failed: "+str(e))
+                        time.sleep(25)
